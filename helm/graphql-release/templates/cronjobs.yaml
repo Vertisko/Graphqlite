@@ -1,0 +1,33 @@
+apiVersion: batch/v1beta1
+kind:       CronJob
+metadata:
+  name: {{ template "trackableappname" . }}-sync-epg
+spec:
+  schedule: "15 */4 * * *"
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            job-group: "core-graphql-sync-epg"
+            job-alerts: "true"
+            job-period: "hourly"
+        spec:
+          {{- if .Values.image.credSecret }}
+          imagePullSecrets:
+            - name: {{ .Values.image.credSecret }}
+          {{- end }}
+          containers:
+            - name: {{ .Values.image.name }}
+              image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              envFrom:
+                - configMapRef:
+                    name: graphql
+                - secretRef:
+                    name: graphql
+              args:
+                - /bin/sh
+                - -c
+                - bin/console livesporttv:epg:sync
+          restartPolicy: OnFailure

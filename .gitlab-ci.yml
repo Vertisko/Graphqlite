@@ -1,0 +1,259 @@
+.loadFunctions: &loadFunctions |
+    export KUBE_NAMESPACE=$CI_ENVIRONMENT_SLUG
+    export DB_MIGRATE="bin/console doctrine:migrations:migrate --no-interaction"
+
+    function ensure_namespace() {
+        echo "namespace: $KUBE_NAMESPACE"
+        kubectl describe namespace "$KUBE_NAMESPACE" || kubectl create namespace "$KUBE_NAMESPACE"
+    }
+
+    function set_prod_context() {
+        kubectl config use-context $PROD_CLUSTER_CONTEXT
+    }
+
+    function deploy() {
+        name=$APP_NAME-$RELEASE_SUFIX
+
+        if [ "$FORCE_PURGE" = "1" -a "$RELEASE_SUFIX" != "prod" -o "$FORCE_PURGE_PROD" = "1" -a "$RELEASE_SUFIX" = "prod" ]; then
+            echo "Purging old deploys..."
+            # temporary bugfix https://github.com/helm/helm/issues/3353
+            helm delete --purge "$name"
+        fi
+
+        echo "Deploying... $name"
+
+        helm upgrade --install --debug --timeout=1800 \
+        --wait \
+        --set replicaCount=$REPLICAS \
+        --set image.repository="$(echo "$IMAGE_REPOSITORY" | tr '[:upper:]' '[:lower:]')" \
+        --set image.tag="$(echo "$APP_ENV-$CI_APPLICATION_TAG" | tr '[:upper:]' '[:lower:]')" \
+        --set image.name="nginx-php" \
+        --set service.url="$RELEASE_URL" \
+        --set horizontalPodAutoscaler.maxReplicaCount="$HPA_MAX_POD_COUNT" \
+        --set application.migrateCommand="$DB_MIGRATE" \
+        --set ingress.tls.enabled=true  \
+        --set ingress.issuer=$INGRESS_ISSUER \
+        --set ingress.redirectToWww=$INGRESS_WWW_REDIRECT \
+        --set image.credSecret="$DOCKERHUB_CREDENTIALS_SECRET" \
+        --set resources.limits.memory=$POD_MEMORY \
+        --set resources.requests.memory=$POD_MEMORY \
+        --set resources.limits.cpu=$POD_CPU \
+        --set resources.requests.cpu=$POD_CPU \
+        --set readinessProbe.timeoutSeconds=$READINESS_PROBE_TIMEOUT \
+        --set sentry.branch=$CI_COMMIT_REF_SLUG \
+        --set sentry.commit=sha$CI_COMMIT_SHORT_SHA \
+        --namespace="$KUBE_NAMESPACE" \
+        "$name" \
+        ./helm/graphql-release
+
+        kubectl rollout status -n "$KUBE_NAMESPACE" -w "$ROLLOUT_RESOURCE_TYPE/$name"
+    }
+
+
+# ---------------------------------------------------------------------------
+
+default:
+    image: registry.gitlab.lstv.io/utils/dockerfiles/web-apps/ci-docker:7.4.6-v1
+    cache: &default
+        key: ${CI_COMMIT_REF_SLUG}
+        policy: pull-push
+        paths:
+            - vendor/
+            - public/build/
+            - bin/.phpunit
+    before_script:
+        - eval $(ssh-agent -s)
+        - echo "$SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add - > /dev/null
+        - mkdir -p ~/.ssh
+        - chmod 700 ~/.ssh
+        - ssh-keyscan gitlab.lstv.io >> ~/.ssh/known_hosts
+        - chmod 644 ~/.ssh/known_hosts
+        - *loadFunctions
+    services:
+        - name: redis
+          alias: redis
+
+variables:
+    CI_APPLICATION_REPOSITORY: registry.gitlab.lstv.io/web-apps/livesport-tv-web
+    CI_APPLICATION_REPOSITORY_PROD: livesporttv/livesport-tv-web
+    IMAGE_REPOSITORY: $CI_APPLICATION_REPOSITORY
+    CI_APPLICATION_TAG: sha$CI_COMMIT_SHORT_SHA
+    ROLLOUT_RESOURCE_TYPE: deployment
+    APP_NAME: core-graphql
+    REPLICAS: 1
+    DOCKERHUB_CREDENTIALS_SECRET: ""
+    INGRESS_ISSUER: "letsencrypt-prod-dns"
+    INGRESS_WWW_REDIRECT: "false"
+    POD_MEMORY: 200Mi
+    POD_CPU: 500m
+    READINESS_PROBE_TIMEOUT: 2
+    HPA_MAX_POD_COUNT: 2
+
+stages:
+    - install
+    - codeAnalysis
+    - tests
+    - build
+    - deploy
+    - documentation
+
+installDependencies:
+    stage: install
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+        - composer assets
+        - composer tests-setup
+    cache:
+        <<: *default
+        policy: push
+    only:
+        - merge_requests
+
+staticAnalysis:
+    stage: codeAnalysis
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+        - vendor/bin/phpstan --version
+        - composer phpstan
+    cache:
+        <<: *default
+        policy: pull
+    only:
+        - merge_requests
+
+codingStandards:
+    stage: codeAnalysis
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+        - composer cs-fix-dry
+    cache:
+        <<: *default
+        policy: pull
+    only:
+        - merge_requests
+
+tests:unit:
+    stage: tests
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+        - composer tests-unit
+    cache:
+        <<: *default
+        policy: pull
+    only:
+        - merge_requests
+
+build:develop:
+    stage: build
+    variables:
+        DOCKER_DRIVER: overlay
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts
+        - php -d memory_limit=-1 bin/console assets:install
+        - rm -rf var/*
+        - php -d memory_limit=-1 bin/console cache:warmup
+        - chmod -R 0777 var/*
+        - composer dumpautoload -o --classmap-authoritative
+        - docker login --username $DOCKERHUB_USERNAME --password $DOCKERHUB_PASSWORD registry.gitlab.lstv.io
+        - docker build -t $CI_APPLICATION_REPOSITORY:develop-$CI_APPLICATION_TAG .
+        - docker push $CI_APPLICATION_REPOSITORY:develop-$CI_APPLICATION_TAG
+        - docker login --username $DOCKERHUB_USERNAME_PROD --password $DOCKERHUB_PASSWORD_PROD
+        - docker build -t $CI_APPLICATION_REPOSITORY_PROD:develop-$CI_APPLICATION_TAG .
+        - docker push $CI_APPLICATION_REPOSITORY_PROD:develop-$CI_APPLICATION_TAG
+    cache:
+        <<: *default
+        policy: pull
+    only:
+        - develop
+        - feature/CORE-49
+
+build:prod:
+    stage: build
+    variables:
+        DOCKER_DRIVER: overlay
+    script:
+        - composer install --prefer-dist --no-ansi --no-interaction --no-progress --no-scripts --no-dev
+        - rm -rf var/*
+        - bin/console cache:warmup
+        - chmod -R 0777 var/*
+        - composer dumpautoload -o --classmap-authoritative --no-dev
+        - docker login --username $DOCKERHUB_USERNAME --password $DOCKERHUB_PASSWORD registry.gitlab.lstv.io
+        - docker build -t $CI_APPLICATION_REPOSITORY:prod-$CI_APPLICATION_TAG .
+        - docker push $CI_APPLICATION_REPOSITORY:prod-$CI_APPLICATION_TAG
+        - docker login --username $DOCKERHUB_USERNAME_PROD --password $DOCKERHUB_PASSWORD_PROD
+        - docker build -t $CI_APPLICATION_REPOSITORY_PROD:prod-$CI_APPLICATION_TAG .
+        - docker push $CI_APPLICATION_REPOSITORY_PROD:prod-$CI_APPLICATION_TAG
+    cache:
+        <<: *default
+        policy: pull
+    only:
+        - /^release\/.*$/
+        - master
+
+deploy:develop:
+    stage: deploy
+    script:
+        - export APP_ENV=develop
+        - export RELEASE_URL=$DEVELOP_RELEASE_URL
+        - export RELEASE_SUFIX=develop
+        - export DOCKERHUB_CREDENTIALS_SECRET=dockerhub-credentials
+        - export IMAGE_REPOSITORY=$CI_APPLICATION_REPOSITORY_PROD
+        - export READINESS_PROBE_TIMEOUT=5
+        - export REPLICAS=2
+        - export HPA_MAX_POD_COUNT=2
+        - echo "Release URL:$RELEASE_URL"
+        - ensure_namespace
+        - deploy
+    environment:
+        name: $APP_NAME-develop
+        url: https://$DEVELOP_RELEASE_URL
+    cache: {}
+    only:
+        - develop
+        - feature/CORE-49
+
+deploy:beta:
+    stage: deploy
+    script:
+        - export APP_ENV=prod
+        - export RELEASE_URL=$BETA_RELEASE_URL
+        - export RELEASE_SUFIX=beta
+        - export DOCKERHUB_CREDENTIALS_SECRET=dockerhub-credentials
+        - export IMAGE_REPOSITORY=$CI_APPLICATION_REPOSITORY_PROD
+        - export REPLICAS=2
+        - export HPA_MAX_POD_COUNT=6
+        - echo "Release URL:$RELEASE_URL"
+        - ensure_namespace
+        - deploy
+    environment:
+        name: $APP_NAME-beta
+        url: https://$BETA_RELEASE_URL
+    cache: {}
+    only:
+        - /^release\/.*$/
+
+deploy:production:
+    stage: deploy
+    script:
+        - export APP_ENV=prod
+        - export RELEASE_URL=$PROD_RELEASE_URL
+        - export RELEASE_SUFIX=prod
+        - export INGRESS_ISSUER="letsencrypt-prod"
+        - export INGRESS_WWW_REDIRECT=true
+        - export DOCKERHUB_CREDENTIALS_SECRET=dockerhub-credentials
+        - export IMAGE_REPOSITORY=$CI_APPLICATION_REPOSITORY_PROD
+        - export POD_MEMORY=604Mi
+        - export POD_CPU=3
+        - export REPLICAS=5
+        - export HPA_MAX_POD_COUNT=15
+        - echo "Release URL:$RELEASE_URL"
+        - echo "Image:$IMAGE_REPOSITORY:$APP_ENV-$CI_APPLICATION_TAG"
+        - ensure_namespace
+        - set_prod_context
+        - deploy
+    environment:
+        name: $APP_NAME-prod
+        url: https://$PROD_RELEASE_URL
+    cache: {}
+    only:
+        - master

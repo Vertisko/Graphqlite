@@ -1,0 +1,46 @@
+version: '3.7'
+services:
+  db:
+    image: postgres:12.1
+    container_name: graphqlite-db
+    restart: always
+    ports:
+      - 5434:5432
+    volumes:
+      - ./.docker/postgres:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: livesporttv
+      POSTGRES_PASSWORD: livesporttv
+      POSTGRES_DB: graphqlite_dev
+
+  adminer:
+    image: adminer:4.7.7
+    container_name: graphqlite-adminer
+    restart: always
+    extra_hosts:
+      - "mysql.lstv.io:10.10.0.51"
+    ports:
+      - 8092:8080
+
+  php:
+    image: registry.gitlab.lstv.io/utils/dockerfiles/core/server:7.4.6-v2
+    container_name: graphqlite-php
+    restart: always
+    volumes:
+      - ~/.ssh:/root/.ssh #loads local ssh public key for granting access to private gitlab repositories
+      - .:/var/www/html:cached
+    environment:
+      TZ: "Europe/Prague"
+
+  nginx:
+    #image: nginx
+    image: tarantool/tarantool-nginx
+    container_name: graphqlite-nginx
+    restart: always
+    ports:
+      - 8001:80
+    volumes:
+      - ./docker/nginx/default:/etc/nginx/conf.d/default.conf:cached
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:cached
+      - .:/var/www/html:cached
+

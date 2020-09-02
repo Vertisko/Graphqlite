@@ -1,0 +1,43 @@
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: {{ template "fullname" . }}
+  labels:
+    app: {{ template "appname" . }}
+    chart: "{{ .Chart.Name }}-{{ .Chart.Version| replace "+" "_" }}"
+    release: {{ .Release.Name }}
+  annotations:
+    nginx.ingress.kubernetes.io/affinity: "cookie"
+    nginx.ingress.kubernetes.io/session-cookie-name: "session-affinity"
+    nginx.ingress.kubernetes.io/session-cookie-expires: "172800"
+    nginx.ingress.kubernetes.io/session-cookie-max-age: "172800"
+{{- if .Values.ingress.redirectToWww }}
+    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+{{- end }}
+{{- if .Values.ingress.tls.enabled }}
+    kubernetes.io/tls-acme: "true"
+    cert-manager.io/cluster-issuer: {{ .Values.ingress.issuer }}
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    kubernetes.io/ingress.class: "nginx"
+{{- end }}
+spec:
+{{- if .Values.ingress.tls.enabled }}
+  tls:
+  - hosts:
+  {{- if .Values.service.commonName }}
+    - {{ template "hostname" .Values.service.commonName }}
+  {{- end }}
+    - {{ template "hostname" .Values.service.url }}
+  {{- if .Values.ingress.redirectToWww }}
+    - {{ template "hostname" printf "%s.%s" "www" .Values.service.url }}
+  {{- end }}
+    secretName: {{ .Values.ingress.tls.secretName | default (printf "%s-tls" (include "fullname" .)) }}
+{{- end }}
+  rules:
+  - host: {{- if .Values.ingress.redirectToWww }} {{ template "hostname" printf "%s.%s" "www" .Values.service.url }} {{- else }} {{ template "hostname" .Values.service.url }}{{- end }}
+    http:
+      paths:
+      - path: /
+        backend:
+          serviceName: {{ template "fullname" . }}
+          servicePort: {{ .Values.service.externalPort }}

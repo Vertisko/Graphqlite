@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: graphql
+  namespace: core-graphql-develop
+data:
+  REDIS_DSN: 'redis://10.168.199.107:6379'
+  LSTV_APP_VERSION: 'develop'
+  APP_ENV: 'develop'
+  APP_DEBUG: '1'
+  TIMEZONE: 'UTC'
